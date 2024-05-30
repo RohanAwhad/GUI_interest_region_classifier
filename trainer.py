@@ -3,6 +3,7 @@ import glob
 import json
 import numpy as np
 import os
+import threading
 
 from PIL import Image
 from sklearn.model_selection import train_test_split
@@ -21,7 +22,9 @@ from torch.utils.data import Dataset, DataLoader
 
 SCREEN_SIZE = (1440, 2560) # screen size as per http://www.interactionmining.org/rico.html
 DEVICE = 'mps'
-BATCH_SIZE = 32
+NUM_WORKERS = 6
+LR = 3e-4
+BATCH_SIZE = 16
 EPOCHS = 10
 PRETRAINED_MODEL = "/Users/rohan/3_Resources/ai_models/vit-base-patch16-224"
 
@@ -55,7 +58,7 @@ def has_area(item: dict, threshold: int = 4) -> bool:
   # check to see if has area
   if 'bounds' not in item: return False
   bounds = item['bounds']
-  if bounds[2] - bounds[0] < 2 or bounds[3] - bounds[1] < 2: return False
+  if bounds[2] - bounds[0] < threshold or bounds[3] - bounds[1] < threshold: return False
   return True
 
 def extract_data(item: dict, image_id: str) -> list[dict]:
@@ -156,36 +159,47 @@ class RicModel(torch.nn.Module):
 # Main
 # ===
 
+def process_file(fn: str, all_labels: set[str], flattened_ds: list[dict]) -> None:
+  with open(fn) as f: data = json.load(f)
+  _tmp = os.path.basename(fn).split('.')
+  assert len(_tmp) == 2
+  image_id = _tmp[0]
+  extracted_data = extract_data(data, image_id)
+  flattened_ds.extend(extract_data(data, image_id))
+  all_labels.update(get_labels(data))
+
+
 if __name__ == "__main__":
+  # get all labels and flatten the annotations dict
   all_labels = set()
-  for fn in tqdm(glob.glob(SEMANTIC_ANNOTATIONS_DIR + "/*.json"), desc="Loading all labels"):
-    with open(fn) as f: data = json.load(f)
-    labels = get_labels(data)
-    all_labels.update(labels)
+  flattened_ds = []
+
+  all_threads = []
+  for i, fn in tqdm(enumerate(glob.glob(SEMANTIC_ANNOTATIONS_DIR + "/*.json")), desc="Loading all labels"):
+    thread = threading.Thread(target=process_file, args=(fn, all_labels, flattened_ds))
+    thread.start()
+    all_threads.append(thread)
+    if i % 100 == 0:
+      for thread in all_threads: thread.join()
+      all_threads = []
+  for thread in all_threads: thread.join()
+  for thread in all_threads: assert not thread.is_alive()
+
   print(f'Labels: {all_labels}\nLen: {len(all_labels)}')
+  print(f'Total number of annotations: {len(flattened_ds)}')
   label2idx = {label: idx for idx, label in enumerate(all_labels)}
   idx2label = {idx: label for label, idx in label2idx.items()}
-
-  # flatten the annotations dict
-  flattened_ds = []
-  for fn in tqdm(glob.glob(SEMANTIC_ANNOTATIONS_DIR + "/*.json")):
-    with open(fn) as f: data = json.load(f)
-    _tmp = os.path.basename(fn).split('.')
-    assert len(_tmp) == 2
-    image_id = _tmp[0]
-    extracted_data = extract_data(data, image_id)
-    flattened_ds.extend(extract_data(data, image_id))
-  print(f'Total number of annotations: {len(flattened_ds)}')
+  with open('label2idx.json', 'w') as f: json.dump(label2idx, f)
 
 
   # train test split
-  train_ds, test_ds = train_test_split(flattened_ds[:100], test_size=0.2, random_state=42)
+  train_ds, test_ds = train_test_split(flattened_ds, test_size=0.2, random_state=42)
 
   processor = AutoImageProcessor.from_pretrained(PRETRAINED_MODEL)
   train_ds = RicDataset(train_ds, IMAGE_DIR, IMAGE_EXT, label2idx, processor)
   test_ds = RicDataset(test_ds, IMAGE_DIR, IMAGE_EXT, label2idx, processor)
-  train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-  test_dl = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+  train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
+  test_dl = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
 
   # define model
   backbone = AutoModel.from_pretrained(PRETRAINED_MODEL)
@@ -195,7 +209,7 @@ if __name__ == "__main__":
   for param in backbone.parameters(): param.requires_grad = False
 
   # optimizer
-  optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+  optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
   # loss_fn
   criterion = F.cross_entropy
@@ -203,33 +217,42 @@ if __name__ == "__main__":
   # training loop
   model.to(DEVICE)
 
-  for epoch in range(EPOCHS):
-    model.train()
-    train_loss = []
-    pbar = tqdm(train_dl, total=len(train_dl), desc='Training')
-    for batch in pbar:
+  try:
+    for epoch in range(EPOCHS):
+      model.train()
       optimizer.zero_grad()
-      pixel_values = batch['pixel_values'].to(DEVICE)
-      labels = batch['label'].to(DEVICE)
-      pred = model(pixel_values)
-      loss = criterion(pred, labels)
-      loss.backward()
-      optimizer.step()
-      train_loss.append(loss.item())
-      pbar.set_postfix({'loss': train_loss[-1]})
-    pbar.close()
-
-    model.eval()
-    test_loss = []
-    with torch.no_grad():
-      pbar = tqdm(test_dl, total=len(test_dl), desc='Testing')
+      train_loss = []
+      pbar = tqdm(train_dl, total=len(train_dl), desc=f'Epoch {epoch}: Training')
       for batch in pbar:
         pixel_values = batch['pixel_values'].to(DEVICE)
         labels = batch['label'].to(DEVICE)
         pred = model(pixel_values)
         loss = criterion(pred, labels)
-        test_loss.append(loss.item())
-        pbar.set_postfix({'loss': test_loss[-1]})
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        train_loss.append(loss.item())
+        pbar.set_postfix({'loss': train_loss[-1]})
       pbar.close()
 
-    print(f'Epoch {epoch}: train loss {np.mean(train_loss):.4f}, test loss {np.mean(test_loss):.4f}')
+      model.eval()
+      test_loss = []
+      with torch.no_grad():
+        pbar = tqdm(test_dl, total=len(test_dl), desc=f'Epoch {epoch}: Testing')
+        for batch in pbar:
+          pixel_values = batch['pixel_values'].to(DEVICE)
+          labels = batch['label'].to(DEVICE)
+          pred = model(pixel_values)
+          loss = criterion(pred, labels)
+          test_loss.append(loss.item())
+          pbar.set_postfix({'loss': test_loss[-1]})
+        pbar.close()
+
+      print(f'Epoch {epoch}: train loss {np.mean(train_loss):.4f}, test loss {np.mean(test_loss):.4f}')
+
+  except KeyboardInterrupt:
+    print('Interrupted by user')
+  finally:
+    # save model
+    model.to('cpu')
+    torch.save(model.state_dict(), 'model.bin')
