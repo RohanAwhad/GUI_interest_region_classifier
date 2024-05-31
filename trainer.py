@@ -1,8 +1,8 @@
-import cv2
 import glob
 import json
 import numpy as np
 import os
+import pickle
 import threading
 
 from PIL import Image
@@ -21,20 +21,40 @@ from torch.utils.data import Dataset, DataLoader
 # ===
 
 SCREEN_SIZE = (1440, 2560) # screen size as per http://www.interactionmining.org/rico.html
-DEVICE = 'mps'
-NUM_WORKERS = 6
-LR = 3e-4
-BATCH_SIZE = 16
-EPOCHS = 10
-PRETRAINED_MODEL = "/Users/rohan/3_Resources/ai_models/vit-base-patch16-224"
 
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f'device is set to: {DEVICE}')
+NUM_WORKERS = 4
+LR = 3e-4
+BATCH_SIZE = 32
+EPOCHS = 10
+PRETRAINED_MODEL = "google/vit-base-patch16-224"
+
+ROOT_DIR = '/home/rawhad/personal_jobs/GUI_Detection'
 IMAGE_EXT = 'jpg'
-IMAGE_DIR = '/Users/rohan/3_Resources/ai_datasets/rico/combined'
-SEMANTIC_ANNOTATIONS_DIR = '/Users/rohan/3_Resources/ai_datasets/rico/semantic_annotations'
+IMAGE_DIR = os.path.join(ROOT_DIR, 'combined')
+SEMANTIC_ANNOTATIONS_DIR = os.path.join(ROOT_DIR, 'semantic_annotations')
+
+ALL_LABELS_PATH = os.path.join(ROOT_DIR, 'all_labels.pkl')
+FLATTENED_DS_PATH = os.path.join(ROOT_DIR, 'flattened_ds.pkl')
+LABEL2IDX_PATH = os.path.join(ROOT_DIR, 'label2idx.json')
+MODEL_DICT_PATH = os.path.join(ROOT_DIR, 'model.bin')
 
 # ===
 # Utils
 # ===
+
+def load_json(fn: str) -> dict:
+  with open(fn, 'r') as f: return json.load(f)
+
+def save_json(obj: dict, fn: str) -> None:
+  with open(fn, 'w') as f: json.dump(obj, f)
+
+def load_pkl(fn: str):
+  with open(fn, 'rb') as f: return pickle.load(f)
+
+def save_pkl(obj, fn: str):
+  with open(fn, 'wb') as f: return pickle.dump(obj, f)
 
 def get_labels(item: dict) -> list[str]:
   ret = []
@@ -94,13 +114,13 @@ class RicDataset(Dataset):
     item = self.flattened_ds[idx]
 
     # load image
-    img = cv2.imread(os.path.join(self.image_dir, f"{item['image_id']}.{self.image_ext}"))
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img_path = os.path.join(self.image_dir, f"{item['image_id']}.{self.image_ext}")
+    img = Image.open(img_path).convert('RGB')
     # scaled the bounds
     screen_size = item["screen_size"]
     imageData_bounds = [
-      img.shape[1],
-      img.shape[0]
+      img.width,
+      img.height,
     ]
     interest_region_bounds = item["bounds"]
     scaled_bounds = np.array(interest_region_bounds).reshape(2, 2).T / np.array(screen_size).reshape(2, 1) * np.array(imageData_bounds).reshape(2, 1)
@@ -108,29 +128,31 @@ class RicDataset(Dataset):
     left, top, right, bottom = scaled_bounds
     if left > right: left, right = right, left
     if top > bottom: top, bottom = bottom, top
-    # crop the tensor
-    cropped_img = img[top:bottom, left:right]
+    # crop the image
+    cropped_img = img.crop((left, top, right, bottom))
     
-    assert cropped_img.shape == (bottom - top, right - left, 3), (
-      f'Shape mismatch: {cropped_img.shape} != {(bottom - top, right - left, 3)}\n'
-      f'Image Id: {item["image_id"]}\n'
-      f'Bounds: {item["bounds"]}\n'
-      f'Screen size: {screen_size}\n'
-      f'Label: {item["label"]}'
-    )
-    h, w, _ = cropped_img.shape
-    assert h > 0 and w > 0, (
-      f'h should be > 0, but is {h}\n'
-      f'w should be > 0, but is {w}\n'
+		# Check for correct crop dimensions
+    h, w = cropped_img.size
+    assert (h, w) == (right - left, bottom - top), (
+      f'Shape mismatch: {cropped_img.size} != {(right - left, bottom - top)}\n'
       f'Image Id: {item["image_id"]}\n'
       f'Bounds: {item["bounds"]}\n'
       f'Screen size: {screen_size}\n'
       f'Label: {item["label"]}'
     )
 
-    
+		# Ensure height and width are greater than 0
+    assert h > 0 and w > 0, (
+      f'Height and width should be > 0, but are h={h}, w={w}\n'
+      f'Image Id: {item["image_id"]}\n'
+      f'Bounds: {item["bounds"]}\n'
+      f'Screen size: {screen_size}\n'
+      f'Label: {item["label"]}'
+    )
+
     # apply processor
-    pixel_values = self.processor(Image.fromarray(cropped_img), return_tensors='pt', image_mean=None, input_data_format="channels_last").pixel_values
+    pixel_values = self.processor(cropped_img, return_tensors='pt', image_mean=None, input_data_format="channels_last").pixel_values
+
     # return
     return {
       'pixel_values': pixel_values.squeeze(0),
@@ -160,7 +182,7 @@ class RicModel(torch.nn.Module):
 # ===
 
 def process_file(fn: str, all_labels: set[str], flattened_ds: list[dict]) -> None:
-  with open(fn) as f: data = json.load(f)
+  data = load_json(fn)
   _tmp = os.path.basename(fn).split('.')
   assert len(_tmp) == 2
   image_id = _tmp[0]
@@ -171,25 +193,31 @@ def process_file(fn: str, all_labels: set[str], flattened_ds: list[dict]) -> Non
 
 if __name__ == "__main__":
   # get all labels and flatten the annotations dict
-  all_labels = set()
-  flattened_ds = []
+  if os.path.exists(ALL_LABELS_PATH) and os.path.exists(FLATTENED_DS_PATH):
+    all_labels = load_pkl(ALL_LABELS_PATH)
+    flattened_ds = load_pkl(FLATTENED_DS_PATH)
+  else:
+    all_labels = set()
+    flattened_ds = []
 
-  all_threads = []
-  for i, fn in tqdm(enumerate(glob.glob(SEMANTIC_ANNOTATIONS_DIR + "/*.json")), desc="Loading all labels"):
-    thread = threading.Thread(target=process_file, args=(fn, all_labels, flattened_ds))
-    thread.start()
-    all_threads.append(thread)
-    if i % 100 == 0:
-      for thread in all_threads: thread.join()
-      all_threads = []
-  for thread in all_threads: thread.join()
-  for thread in all_threads: assert not thread.is_alive()
+    all_threads = []
+    for i, fn in tqdm(enumerate(glob.glob(SEMANTIC_ANNOTATIONS_DIR + "/*.json")), desc="Loading all labels"):
+      thread = threading.Thread(target=process_file, args=(fn, all_labels, flattened_ds))
+      thread.start()
+      all_threads.append(thread)
+      if i % 100 == 0:
+        for thread in all_threads: thread.join()
+        all_threads = []
+    for thread in all_threads: thread.join()
+    for thread in all_threads: assert not thread.is_alive()
+    save_pkl(all_labels, ALL_LABELS_PATH)
+    save_pkl(flattened_ds, FLATTENED_DS_PATH)
 
   print(f'Labels: {all_labels}\nLen: {len(all_labels)}')
   print(f'Total number of annotations: {len(flattened_ds)}')
   label2idx = {label: idx for idx, label in enumerate(all_labels)}
   idx2label = {idx: label for label, idx in label2idx.items()}
-  with open('label2idx.json', 'w') as f: json.dump(label2idx, f)
+  save_json(label2idx, LABEL2IDX_PATH)
 
 
   # train test split
@@ -198,8 +226,8 @@ if __name__ == "__main__":
   processor = AutoImageProcessor.from_pretrained(PRETRAINED_MODEL)
   train_ds = RicDataset(train_ds, IMAGE_DIR, IMAGE_EXT, label2idx, processor)
   test_ds = RicDataset(test_ds, IMAGE_DIR, IMAGE_EXT, label2idx, processor)
-  train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
-  test_dl = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
+  train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, prefetch_factor=5)
+  test_dl = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, prefetch_factor=5)
 
   # define model
   backbone = AutoModel.from_pretrained(PRETRAINED_MODEL)
@@ -222,8 +250,8 @@ if __name__ == "__main__":
       model.train()
       optimizer.zero_grad()
       train_loss = []
-      pbar = tqdm(train_dl, total=len(train_dl), desc=f'Epoch {epoch}: Training')
-      for batch in pbar:
+      pbar = tqdm(enumerate(train_dl), total=len(train_dl), desc=f'Epoch {epoch}: Training')
+      for i, batch in pbar:
         pixel_values = batch['pixel_values'].to(DEVICE)
         labels = batch['label'].to(DEVICE)
         pred = model(pixel_values)
@@ -233,6 +261,11 @@ if __name__ == "__main__":
         optimizer.zero_grad()
         train_loss.append(loss.item())
         pbar.set_postfix({'loss': train_loss[-1]})
+        if i % 100 == 0:  # save model every 100 steps - overwrite
+          model.to('cpu')
+          torch.save(model.state_dict(), MODEL_DICT_PATH)
+          model.to(DEVICE)
+
       pbar.close()
 
       model.eval()
@@ -255,4 +288,4 @@ if __name__ == "__main__":
   finally:
     # save model
     model.to('cpu')
-    torch.save(model.state_dict(), 'model.bin')
+    torch.save(model.state_dict(), MODEL_DICT_PATH)
